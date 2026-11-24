@@ -1,0 +1,56 @@
+# Idempotent GitHub Release publish job (Tauri multi-platform).
+# Drop-in "Publish" job: replaces an existing same-tag release on CI re-run,
+# refuses to publish an empty release, and resolves tag->commit via the API
+# (NOT via local git — the Publish job has no checkout).
+#
+#   release:
+#     name: Publish GitHub Release
+#     needs: build
+#     runs-on: ubuntu-latest
+#     permissions:
+#       contents: write
+#     steps:
+#       - uses: actions/download-artifact@v4
+#         with:
+#           path: artifacts
+#           merge-multiple: true
+#       - name: Create release with installers
+#         env:
+#           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+#         run: |
+#           set -e
+#           TAG="${{ github.ref_name }}"
+#           REPO="${{ github.repository }}"
+#           mkdir -p dist
+#           find artifacts -type f \( -name '*.exe' -o -name '*.msi' -o -name '*.dmg' -o -name '*.AppImage' \) -exec cp -f {} dist/ \;
+#           ls -lh dist/
+#           # 1. empty-artifact guard: never publish an empty release
+#           test -n "$(ls -A dist/ 2>/dev/null)" || { echo "no installer artifacts found; refusing to publish an empty release"; exit 1; }
+#           # 2. tag -> commit via API (this job has no checkout, so a tag
+#           #    NAME as --target makes gh shell out to git and fails with
+#           #    "fatal: not a git repository"; a raw commit SHA needs no git)
+#           ref_json="$(gh api "repos/$REPO/git/ref/tags/$TAG")"
+#           sha="$(echo "$ref_json" | jq -r .object.sha)"
+#           otype="$(echo "$ref_json" | jq -r .object.type)"
+#           [ "$otype" = "tag" ] && sha="$(gh api "repos/$REPO/git/tags/$sha" --jq .object.sha)"
+#           echo "publishing $TAG at commit $sha"
+#           # 3. idempotent publish: re-run overwrites the existing release
+#           if gh release view "$TAG" >/dev/null 2>&1; then
+#             echo "release $TAG exists — replacing"
+#             gh release delete "$TAG" --yes || true
+#           fi
+#           gh release create "$TAG" \
+#             --title "$TAG — <App Name>" \
+#             --notes "<App Name> $TAG." \
+#             --target "$sha" \
+#             dist/*
+
+# Why: `gh release create` on an existing tag returns 422; a CI re-run after a
+# fix therefore crashes the publish job. delete-then-create keeps re-runs green.
+# `gh release delete <tag> --yes` also removes the tag; add back if needed:
+#   git push origin --tags (or recreate) — but for a re-published tag the
+#   ref already points at the right commit, so usually nothing to do.
+#
+# Annotated tags: `git/ref/tags/<tag>` returns object.type=tag, whose sha is
+# the tag object — peel one more level with `git/tags/<sha>` to get the
+# commit. `gh release create --target` wants the commit, hence the peel.

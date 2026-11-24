@@ -1,0 +1,55 @@
+[package]
+name = "myapp"
+version = "0.1.0"
+edition = "2021"
+description = "A cross-platform desktop application"
+authors = ["Your Name <your.email@example.com>"]
+license = "MIT"
+repository = "https://github.com/yourusername/myapp"
+keywords = ["tauri", "desktop", "cross-platform"]
+categories = ["gui", "utilities"]
+
+[lib]
+name = "myapp_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[[bin]]
+name = "myapp"
+path = "src/main.rs"
+
+[dependencies]
+# Tauri
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-shell = "2"
+tauri-plugin-dialog = "2"
+tauri-plugin-fs = "2"
+tauri-plugin-notification = "2"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Async
+tokio = { version = "1", features = ["full"] }
+
+# Paths & filesystem
+dirs = "5"
+fs_extra = "1"
+
+# UUID & time
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+
+# Error handling
+anyhow = "1"
+thiserror = "1"
+
+[build-dependencies]
+tauri-build = { version = "2" }
+
+[profile.release]
+panic = "abort"
+codegen-units = 1
+lto = true
+opt-level = "s"
+strip = true

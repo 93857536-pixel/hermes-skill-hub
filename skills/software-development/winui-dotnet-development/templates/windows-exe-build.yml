@@ -1,0 +1,157 @@
+# Windows EXE 自动构建 (GitHub Actions) — MediaConverter 实战模板
+
+来源: MediaConverter 2026-08 实战。本机(macOS)无 dotnet/Windows,但用户要求
+Release 必须交付 exe 而非源码/zip → 用 GitHub Actions 的 windows-latest runner
+远程编译自包含 EXE,自动上传到 Release。触发即用,改 `tag` 输入即可。
+
+## 前置条件
+
+- csproj 必须是 unpackaged 自包含模式(否则产 MSIX 不是裸 exe):
+  - `<WindowsPackageType>None</WindowsPackageType>`
+  - `<WindowsAppSDKSelfContained>true</WindowsAppSDKSelfContained>`
+  - `<Platforms>x64</Platforms>`
+- **必须显式声明 WinUI 包引用**(最常见首次失败原因;`UseWinUI>true` 本身不够,
+  缺失时报 CS0246 IValueConverter / CS0234 Microsoft.UI.Dispatching 等引用错误):
+  ```xml
+  <ItemGroup>
+    <PackageReference Include="Microsoft.WindowsAppSDK" Version="1.8.260710003" />
+    <PackageReference Include="Microsoft.Windows.SDK.BuildTools" Version="10.0.26100.7705" />
+  </ItemGroup>
+  ```
+  版本先校验存在: `curl https://api.nuget.org/v3-flatcontainer/<包名小写>/index.json`。
+- 仓库已启用 Actions(默认);gh CLI 已认证(本机需代理
+  `export HTTPS_PROXY=http://127.0.0.1:1082`)。
+- 触发:`gh workflow run windows-build.yml --ref main -f tag=v1.0.0`
+
+## 关键步骤(与踩坑)
+
+1. `actions/checkout@v4` + `actions/setup-dotnet@v4`(8.0.x)
+2. **publish 必须用 `dotnet msbuild /t:Publish`,不能用 `dotnet publish`**:
+   - `dotnet publish` 不走完整 XAML MarkupCompilePass2 链 → `WMC1509: No
+     LocalAssembly parameter given during MarkupCompilePass2`,随后本项目类型全部
+     解析失败(`WMC0001: Unknown type 'BoolToVisibilityConverter'/'TaskCard'`、
+     `WMC0909: Cannot resolve DataType`)——这些错误**不代表**你的类型有问题,
+     是编译链不对。
+   - 裸 `msbuild` 也不行: windows-latest runner 的 PATH 里没有 msbuild.exe,
+     报 `The term 'msbuild' is not recognized`。用 `dotnet msbuild`(完整 MSBuild
+     引擎,dotnet 已装)。
+   - 正确命令:
+     ```
+     dotnet msbuild Windows/MediaConverter/MediaConverter.csproj `
+       /restore /t:Publish `
+       /p:Configuration=Release /p:Platform=x64 `
+       /p:RuntimeIdentifier=win-x64 /p:SelfContained=true `
+       /p:EnableMsixTooling=true
+     ```
+3. **定位 publish 目录**: 输出在
+   `bin/Release/net8.0-windows10.0.19041.0/win-x64/publish/`,用
+   `Get-ChildItem -Recurse -Filter MediaConverter.exe | Where FullName -match 'win-x64\\publish'`
+   找,别硬编码 TFV 版本号
+4. **捆绑 ffmpeg/ffprobe**: 从 gyan.dev 官方下载解压
+   `https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip`,
+   把 `bin/ffmpeg.exe` + `bin/ffprobe.exe` 复制到发布目录 `bin/` 下
+   (App 内置查找顺序: AppContext.BaseDirectory/bin/ffmpeg.exe 第一优先)
+5. `Compress-Archive "$pubDir\*" MediaConverter-Windows.zip`
+6. 上传: `softprops/action-gh-release@v2` 需要
+   `permissions: contents: write`;`fail_on_unmatched_files: false`
+   避免 tag 输入为空时失败
+7. 触发后轮询:`gh run view <id> --json status,conclusion`,
+   `gh run view <id> --log | grep -E "Error|error CS|WMC|not recognized"` 查失败原因。
+   **pull 完整日志再判断**,别只看监控脚本抓到的模糊 "exit code 1"。
+
+## 完整模板
+
+```yaml
+name: Build Windows EXE
+
+on:
+  workflow_dispatch:        # 手动触发
+    inputs:
+      tag:
+        description: 'Git tag to attach the build to (e.g. v1.0.0)'
+        required: true
+        default: 'v1.0.0'
+  push:
+    branches: [main]
+    paths: ['Windows/**', '.github/workflows/windows-build.yml']
+
+jobs:
+  build:
+    runs-on: windows-latest
+    permissions:
+      contents: write        # 允许上传 Release 资产
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET 8
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Publish self-contained EXE
+        shell: pwsh
+        run: |
+          # 必须 dotnet msbuild /t:Publish(dotnet publish 缺 XAML MarkupCompilePass2,
+          # 裸 msbuild 不在 runner PATH)。见 SKILL.md "首次真实编译的坑"。
+          dotnet msbuild Windows/MediaConverter/MediaConverter.csproj `
+            /restore /t:Publish `
+            /p:Configuration=Release /p:Platform=x64 `
+            /p:RuntimeIdentifier=win-x64 /p:SelfContained=true `
+            /p:EnableMsixTooling=true
+
+      - name: Locate publish output
+        id: pub
+        shell: pwsh
+        run: |
+          $pub = Get-ChildItem -Path Windows/MediaConverter/bin/Release -Recurse `
+            -Filter MediaConverter.exe | Where-Object { $_.FullName -match 'win-x64\\publish' } | Select-Object -First 1
+          if (-not $pub) { throw "MediaConverter.exe not found in publish output" }
+          $dir = $pub.DirectoryName
+          Write-Output "publish_dir=$dir" >> $env:GITHUB_OUTPUT
+          Write-Output "exe_path=$($pub.FullName)" >> $env:GITHUB_OUTPUT
+
+      - name: Bundle ffmpeg/ffprobe
+        shell: pwsh
+        run: |
+          $pubDir = "${{ steps.pub.outputs.publish_dir }}"
+          Invoke-WebRequest -Uri "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip" `
+            -OutFile "$env:TEMP\ffmpeg.zip" -UseBasicParsing
+          Expand-Archive "$env:TEMP\ffmpeg.zip" -DestinationPath "$env:TEMP\ffmpeg" -Force
+          $ffbin = Get-ChildItem -Path "$env:TEMP\ffmpeg" -Recurse -Filter "ffmpeg.exe" | Select-Object -First 1
+          if (-not $ffbin) { throw "ffmpeg.exe not found in downloaded archive" }
+          New-Item -ItemType Directory -Force -Path "$pubDir\bin" | Out-Null
+          Copy-Item "$($ffbin.DirectoryName)\ffmpeg.exe"  "$pubDir\bin\ffmpeg.exe"  -Force
+          Copy-Item "$($ffbin.DirectoryName)\ffprobe.exe" "$pubDir\bin\ffprobe.exe" -Force
+
+      - name: Smoke test (ffmpeg version)
+        shell: pwsh
+        run: |
+          $pubDir = "${{ steps.pub.outputs.publish_dir }}"
+          & "$pubDir\bin\ffmpeg.exe" -version | Select-Object -First 1
+
+      - name: Package zip
+        shell: pwsh
+        run: |
+          $pubDir = "${{ steps.pub.outputs.publish_dir }}"
+          Compress-Archive -Path "$pubDir\*" -DestinationPath "MediaConverter-Windows.zip" -Force
+
+      - name: Upload to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag || 'v1.0.0' }}
+          files: MediaConverter-Windows.zip
+          fail_on_unmatched_files: false
+```
+
+## 验证
+
+- workflow 静态验证: 结构(name/jobs/runs-on/steps)+ publish 命令完整 +
+  权限字段 + csproj 模式匹配;缩进必须偶数(手写 YAML 常见错)。
+- 真实验证靠 GitHub Actions 日志与 Release 资产列表(`gh release view <tag>
+  --json assets`),云构建结果回传后核对。
+- 注意 grep 跨行续行坑: workflow 里反引号续行的多行命令,单行 grep 匹配不到;
+  验证脚本要先把 `\`\n` 折叠成空格再搜。
+- 首次云构建失败是**预期**的: 包引用 → XAML 语法 → 编译链 → msbuild 可用性,
+  按 SKILL.md "首次真实编译的坑" ①②③④ 逐层排查,每轮 pull 完整日志。
